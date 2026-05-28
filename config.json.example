@@ -1,0 +1,8 @@
+{
+  "user_name": "Your first name",
+  "meeting_docs": {
+    "Example Person": {
+      "url": "https://docs.google.com/document/d/your-doc-id/edit"
+    }
+  }
+}

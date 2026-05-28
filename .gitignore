@@ -1,0 +1,16 @@
+# OS files
+.DS_Store
+
+# Update check
+.update-cache
+.update-check-disabled
+
+# Python
+__pycache__/
+*.pyc
+
+# Per-user config (not published)
+config.json
+
+# Private local data (not published)
+data/
