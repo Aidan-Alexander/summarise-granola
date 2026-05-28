@@ -167,13 +167,19 @@ function renderInline(textEl, str) {
     textEl.appendText(t.text);
     var end = textEl.getText().length - 1;
     if (end < start) continue;
-    if (t.bold)   textEl.setBold(start, end, true);
-    if (t.italic) textEl.setItalic(start, end, true);
+
+    // Always set state explicitly — appended text inherits formatting from
+    // the previous range otherwise, which causes bold/italic to bleed.
+    textEl.setBold(start, end, !!t.bold);
+    textEl.setItalic(start, end, !!t.italic);
+
     if (t.code) {
       textEl.setFontFamily(start, end, "Consolas");
       textEl.setBackgroundColor(start, end, "#f1f3f4");
     }
-    if (t.link)   textEl.setLinkUrl(start, end, t.link);
+
+    // Same for links: explicit null clears any inherited link.
+    textEl.setLinkUrl(start, end, t.link || null);
   }
 }
 
