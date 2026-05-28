@@ -33,23 +33,25 @@ If you want the summaries to look properly formatted (real headings, bold text, 
 
 11. Copy the **Web app URL** it gives you
 
-12. Open `~/.claude/skills/summarise-granola/config.json` in any text editor and add a `webapp_url` line, like this:
+12. Open Claude Code and paste this in (replacing `PASTE_URL_HERE` with the URL you just copied):
 
-    ```json
-    {
-      "user_name": "Your Name",
-      "webapp_url": "https://script.google.com/macros/s/.../exec",
-      "meeting_docs": { ... }
-    }
+    ```
+    Please save this as my webapp_url in the summarise-granola config: PASTE_URL_HERE
     ```
 
-    (Don't forget the comma after `"Your Name"`.)
+    Claude will update your `config.json` for you.
 
 That's it. Next time you run `/summarise-granola`, the Google Doc will be properly formatted.
 
 ## If you want to turn it off later
 
-Just delete the `webapp_url` line from your `config.json`. The skill goes back to plain-text Google Docs.
+In Claude Code, paste:
+
+```
+Please remove the webapp_url from my summarise-granola config.
+```
+
+The skill will go back to plain-text Google Docs.
 
 ## What it handles
 
