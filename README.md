@@ -1,4 +1,4 @@
-# Summarise Granola
+# PLEASE READ ME BEFORE INSTALLING
 
 A Claude Code skill that turns Granola meeting transcripts into detailed, structured summaries -- then files them where you need them.
 
