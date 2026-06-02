@@ -144,23 +144,26 @@ Store the results (person registry data, project association, meeting doc refere
 
 **Progression:** The summary agent runs in the background while you ask the Step 3.5 sharing questions (and while the user answers them). It must finish before Step 4 (the Google Doc save) — if it is still running when you reach Step 4, wait for its completion notification rather than polling. The pre-fetch runs concurrently and is quick.
 
+**Step 4 gates only on the summary being ready — never on the user's Step 3.5 answer.** As soon as the summary completes, create the standalone Google Doc and link it into the meeting doc (Step 4), even if the sharing question is still unanswered or was dismissed. Adding the summary to the meeting doc must never wait on the comms decision.
+
 ### Step 3.5: Ask about sharing (while the summary generates)
 
 For 1:1 calls where the other participant has a clear name, ask the sharing questions **now** — immediately after launching the summary agent in Step 3, so the user answers while the summary generates in the background. Send them in their own message so the user sees them right away.
+
+**Adding the summary to the meeting doc is NOT one of these questions.** For 1:1 calls with a meeting doc configured, the meeting-doc summary (standalone Google Doc + a date-linked entry in the "Meeting recording summaries" tab) is added automatically in Step 4 as soon as the summary is ready — it never waits on the answer to this sharing question, and it still happens even if the user dismisses or ignores the question. This question covers only the optional comms: email, Slack DM, and tidied transcript.
 
 **Skip this step for:** group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions.
 
 **Step 3.5a: Ask sharing options**
 
-Use AskUserQuestion with `multiSelect: true`:
+Use AskUserQuestion with `multiSelect: true`. Do **not** include an "Add summary to meeting doc" option — that happens automatically in Step 4 and is never gated on this question.
 
-- **"Add summary to meeting doc"** — only show if the other participant has a meeting doc configured in `config.json` (check `meeting_docs` for a key matching their name, case-insensitive; the Step 3 pre-fetch has already loaded this). Creates a standalone summary Google Doc and adds a date-linked entry to the "Meeting recording summaries" tab in the person's existing meeting doc.
 - **"Send call notes email to [Person Name]"** — always show for 1:1 calls (creates a Gmail draft)
 - **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
 - **"Create tidied transcript"** — always show (off by default). Fire-and-forget background agent that runs AFTER the main workflow finishes (Step 8). Does not block the Google Doc save or the Slack/email send.
 - **"Skip"** — always show, and is the default only when the user is explicitly shown the options and submits an empty response; it is not the default when the question was never asked.
 
-**Codex fallback:** If `AskUserQuestion` or multi-select questions are unavailable, ask the sharing-options question as a normal chat message and STOP until the user answers. The summary agent launched in Step 3 keeps generating in the background while you wait — that's fine and intended — but do not start project filing, Google Doc creation, email, Slack, or tidied-transcript work before the user has answered. For 1:1 calls, do not treat silence or lack of tool support as "Skip".
+**Codex fallback:** If `AskUserQuestion` or multi-select questions are unavailable, ask the sharing-options question as a normal chat message and STOP until the user answers. The summary agent launched in Step 3 keeps generating in the background while you wait — that's fine and intended. Still add the summary to the meeting doc automatically (Step 4) as soon as it is ready; that proceeds without the answer. But do not start project filing, email, Slack, or tidied-transcript work before the user has answered. For 1:1 calls, do not treat silence or lack of tool support as "Skip".
 
 **Important:** This question MUST be sent alone (not bundled with the Step 3 agent launch or any Bash tool calls in the same message). The summary agent is already running in the background from Step 3; sending this question in its own separate message ensures the user sees it immediately rather than only after the agent completes.
 
@@ -182,7 +185,7 @@ Hold all answers (sharing selections, comment, auto-send preference) for use in 
 
 ### Step 4: Save summary to Google Drive
 
-This step creates a standalone Google Doc with the summary and, for 1:1 calls, links it from the person's meeting doc.
+This step creates a standalone Google Doc with the summary and, for 1:1 calls, links it from the person's meeting doc. **Run it as soon as the summary is ready — do not wait for the user to answer the Step 3.5 sharing question.** Adding the summary to the meeting doc is automatic for every 1:1 with a configured meeting doc; it is never gated on the comms decision, and it still runs if the sharing question was dismissed or ignored.
 
 **Step 4a: Create standalone summary Google Doc**
 
@@ -209,7 +212,7 @@ Either way: note the returned doc ID and URL for subsequent steps. The doc is im
 
 **Step 4b: For 1:1 calls — link from the meeting doc's "Meeting recording summaries" tab**
 
-Only runs if the user selected "Add summary to meeting doc" in Step 3.5.
+Runs automatically for every 1:1 call where a meeting doc is configured (in `config.json` or the people registry). Do not wait for — or condition this on — the Step 3.5 sharing answer.
 
 **Look up the meeting doc:**
 
