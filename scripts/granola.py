@@ -412,8 +412,15 @@ def get_transcript(doc_id: str):
     with open(filepath, 'w') as f:
         f.write(markdown)
 
-    print(markdown)
-    print(f"\n---\nTranscript saved to: {filepath}", file=sys.stderr)
+    # Print only the path + metadata, never the transcript body: the body is
+    # large and is read directly from `saved_to` by the summary/tidied agents,
+    # so echoing it to stdout would needlessly load it into the caller's context.
+    print(json.dumps({
+        "saved_to": str(filepath),
+        "title": title,
+        "date": date_str,
+        "chars": len(markdown),
+    }))
 
 
 def get_recent_transcript(n: int = 1):

@@ -5,7 +5,7 @@ description: For Granola call or meeting summaries, including "summarise my call
 
 # Granola transcript summarisation
 
-This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, saves it as a standalone Google Doc, and optionally links it from the person's meeting doc. For 1:1 calls where a meeting doc is configured, a link is added to the "Meeting recording summaries" tab (using the meeting date as the link text). For non-1:1 calls or when no meeting doc is configured, a standalone Google Doc is created for easy sharing. Optionally sends call notes via email or Slack DM. A tidied transcript is opt-in and runs in the background after the main workflow.
+This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, saves it as a standalone Google Doc, and optionally links it from the person's meeting doc. For 1:1 calls where a meeting doc is configured, a link is added to the "Meeting recording summaries" tab (using the meeting date as the link text). For calls with no configured meeting doc, a standalone Google Doc is created for easy sharing. Optionally sends call notes via email or Slack DM. A tidied transcript is opt-in and runs in the background after the main workflow.
 
 ## Configuration
 
@@ -38,9 +38,13 @@ The skill reads per-user settings from `config.json` in the skill directory (`~/
 
 **Config fields:**
 - `user_name` (required): first name, used in summaries, doc titles, and email sign-offs
-- `meeting_docs` (optional): map of person display names to `{"url": "..."}`. If empty or missing, the "Add summary to meeting doc" option is hidden in Step 3.5 and Step 4b's auto-linking is skipped.
+- `meeting_docs` (optional): map of person display names to `{"url": "..."}`, matched (case-insensitive) against the other participant's name. If empty or missing, Step 4b's meeting-doc auto-linking is skipped (a standalone Google Doc is still created in Step 4a).
+- `webapp_url` (optional): Apps Script web app for formatted Google Docs in Step 4a — see `references/apps-script/README.md`. If unset, docs are plain text.
+- `meeting_doc_link_webapp_url` (optional): Apps Script web app for linking the summary into the meeting doc — see `references/apps-script/README.md`.
 
 ## Workflow
+
+**Ordering principle (read this first):** Everything that always happens — generating the summary, creating the standalone Google Doc, and (for 1:1s) linking it into the meeting doc — runs first and needs **no user input**. The only interactive decision, sharing the notes with the attendee (email / Slack DM), is saved for the **very end** (Step 7). This lets the user trigger the skill, walk away, and come back to find only the quick sharing question waiting. **Never ask the sharing question before the summary, the Google Doc, and the meeting-doc link are all done.**
 
 ### Step 1: Check for recent calls
 
@@ -82,7 +86,7 @@ Or by number if user selected from the list:
 python3 ~/.claude/skills/summarise-granola/scripts/granola.py recent <n>
 ```
 
-The transcript is automatically saved to `data/transcripts/`.
+The transcript is saved to `data/transcripts/`. The command prints a small JSON object — `{"saved_to": "...", "title": "...", "date": "...", "chars": N}` — **not** the transcript body. Note the `saved_to` path: pass that path (never the contents) to the summary and tidied-transcript agents, so the large transcript never enters the orchestrator's context.
 
 ### Step 2.3: Apply STT corrections (optional)
 
@@ -120,21 +124,21 @@ Provide a free-text input option since participant names can't be predicted.
 
 **Store the confirmed names** and use them consistently throughout the tidied transcript and summary.
 
-### Step 3: Launch summary agent and pre-fetch (parallel)
+### Step 3: Generate the summary (+ pre-fetch in parallel)
 
-Launch the summary agent **before** asking the Step 3.5 sharing questions, so the slow summary generation runs while the user reads and answers them. Launch it **in the background** (`run_in_background: true`) alongside the pre-fetch work in a single message, then move straight to Step 3.5. This front-loads the time-consuming work instead of making the user wait on questions first.
+Launch the summary agent **in the background** (`run_in_background: true`) alongside the people-registry pre-fetch in a single message, then **wait for the summary to finish** before moving to Step 4. Backgrounding it lets the quick pre-fetch run alongside the slow opus summary; do not poll while you wait — you'll get a completion notification.
 
-**Do NOT launch the tidied transcript agent here.** The tidied transcript agent runs at the very end (Step 8) as a fire-and-forget background task, AFTER the Google Doc save and Slack/email have been sent. This keeps it off the critical path entirely.
+**Do NOT ask the sharing question here, and do NOT launch the tidied transcript agent here.** Both happen at the end (Steps 7 and 8), after the summary, Google Doc, and meeting-doc link are done. Keep them off the critical path so the user can walk away during the slow part.
 
 **Summary agent** (`model: "opus"`, `run_in_background: true`)
 
 Before launching, `Read` `references/summary-format.md` in an earlier message — paste its full contents verbatim into the agent prompt. The agent has no access to skill files, so the guidelines must travel with the prompt. (Read it before you launch so its contents are ready to paste; do not bundle the `Read` with the `Agent` call, or you won't have the contents yet.)
 
-Prompt the agent with: the full raw transcript text, the confirmed participant names, the summary-format contents, and an instruction to write the result to `data/summaries/` using the same filename as the transcript (with `--summary.md` suffix).
+Prompt the agent with: the **absolute path to the raw transcript** (the `saved_to` value from Step 2) plus an explicit instruction to `Read` that file itself, the confirmed participant names, the summary-format contents (pasted verbatim — the agent can't see skill files), and an instruction to write the result to `data/summaries/` using the same filename as the transcript (with `--summary.md` suffix). **Do not paste the transcript body into the prompt** — passing the path keeps the transcript (often 10k–25k tokens) out of the orchestrator's context; the agent reads it directly from disk.
 
 **Pre-fetch: People registry** (in parallel with the agent)
 
-Before the agent finishes, look up the other participant. Run this **in the same message as the agent launch:**
+In the **same message as the agent launch**, find the matching meeting doc:
 
 1. Check `config.json` for a matching entry in `meeting_docs` (case-insensitive name match). If found, note the doc URL for use in Step 4.
 2. If not in config, read the local people registry: `cat ~/.claude/skills/summarise-granola/data/people.json` (may not exist — that's fine, skip if missing).
@@ -142,50 +146,11 @@ Before the agent finishes, look up the other participant. Run this **in the same
 
 Store the results (person registry data, project association, meeting doc reference) for use in Steps 4, 5, and 7.
 
-**Progression:** The summary agent runs in the background while you ask the Step 3.5 sharing questions (and while the user answers them). It must finish before Step 4 (the Google Doc save) — if it is still running when you reach Step 4, wait for its completion notification rather than polling. The pre-fetch runs concurrently and is quick.
-
-**Step 4 gates only on the summary being ready — never on the user's Step 3.5 answer.** As soon as the summary completes, create the standalone Google Doc and link it into the meeting doc (Step 4), even if the sharing question is still unanswered or was dismissed. Adding the summary to the meeting doc must never wait on the comms decision.
-
-### Step 3.5: Ask about sharing (while the summary generates)
-
-For 1:1 calls where the other participant has a clear name, ask the sharing questions **now** — immediately after launching the summary agent in Step 3, so the user answers while the summary generates in the background. Send them in their own message so the user sees them right away.
-
-**Adding the summary to the meeting doc is NOT one of these questions.** For 1:1 calls with a meeting doc configured, the meeting-doc summary (standalone Google Doc + a date-linked entry in the "Meeting recording summaries" tab) is added automatically in Step 4 as soon as the summary is ready — it never waits on the answer to this sharing question, and it still happens even if the user dismisses or ignores the question. This question covers only the optional comms: email, Slack DM, and tidied transcript.
-
-**Skip this step for:** group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions.
-
-**Step 3.5a: Ask sharing options**
-
-Use AskUserQuestion with `multiSelect: true`. Do **not** include an "Add summary to meeting doc" option — that happens automatically in Step 4 and is never gated on this question.
-
-- **"Send call notes email to [Person Name]"** — always show for 1:1 calls (creates a Gmail draft)
-- **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
-- **"Create tidied transcript"** — always show (off by default). Fire-and-forget background agent that runs AFTER the main workflow finishes (Step 8). Does not block the Google Doc save or the Slack/email send.
-- **"Skip"** — always show, and is the default only when the user is explicitly shown the options and submits an empty response; it is not the default when the question was never asked.
-
-**Codex fallback:** If `AskUserQuestion` or multi-select questions are unavailable, ask the sharing-options question as a normal chat message and STOP until the user answers. The summary agent launched in Step 3 keeps generating in the background while you wait — that's fine and intended. Still add the summary to the meeting doc automatically (Step 4) as soon as it is ready; that proceeds without the answer. But do not start project filing, email, Slack, or tidied-transcript work before the user has answered. For 1:1 calls, do not treat silence or lack of tool support as "Skip".
-
-**Important:** This question MUST be sent alone (not bundled with the Step 3 agent launch or any Bash tool calls in the same message). The summary agent is already running in the background from Step 3; sending this question in its own separate message ensures the user sees it immediately rather than only after the agent completes.
-
-**Step 3.5b: If email or Slack was selected, ask about comment and auto-send**
-
-If the user selected "Send call notes email" or "Send call notes Slack DM" in 3.5a, immediately ask two follow-up questions in a single AskUserQuestion call. This bundles all user-facing prompts up front so the rest of the workflow can run unattended.
-
-Question 1 — **Comment** (single-select):
-- **"No comment"**
-- **"Add a comment"** — the user will type the comment via the free-text option
-
-Question 2 — **Approval** (single-select):
-- **"Auto-send when ready"** — skip the final preview/confirmation and send as soon as the summary is done
-- **"Show preview first"** — show a preview and wait for explicit confirmation before sending
-
-**If the user picks "Auto-send when ready", do NOT ask for confirmation again in Steps 7b or 7c — just send.** The user has pre-authorised the send.
-
-Hold all answers (sharing selections, comment, auto-send preference) for use in Steps 4 and 7.
+**Progression:** Once the summary agent reports done, run straight through Steps 4–6 (Google Doc → meeting-doc link → project filing → report) with no user input. Only after all of that is complete do you ask the sharing question (Step 7). The pre-fetch runs concurrently with the summary and is quick.
 
 ### Step 4: Save summary to Google Drive
 
-This step creates a standalone Google Doc with the summary and, for 1:1 calls, links it from the person's meeting doc. **Run it as soon as the summary is ready — do not wait for the user to answer the Step 3.5 sharing question.** Adding the summary to the meeting doc is automatic for every 1:1 with a configured meeting doc; it is never gated on the comms decision, and it still runs if the sharing question was dismissed or ignored.
+This step creates a standalone Google Doc with the summary and, for 1:1 calls, links it from the person's meeting doc. **Run it as soon as the summary is ready** — it always happens for every 1:1 with a configured meeting doc and needs no user input. The sharing question hasn't been asked yet (it's Step 7) and is irrelevant here.
 
 **Step 4a: Create standalone summary Google Doc**
 
@@ -212,9 +177,9 @@ Either way: note the returned doc ID and URL for subsequent steps. The doc is im
 
 **Step 4b: For 1:1 calls — link from the meeting doc's "Meeting recording summaries" tab**
 
-Runs automatically for every 1:1 call where a meeting doc is configured (in `config.json` or the people registry). Do not wait for — or condition this on — the Step 3.5 sharing answer.
+Runs automatically for every 1:1 call where a meeting doc is configured (matched in Step 3 by participant name). This is part of the always-happens work — no user input required. If no meeting doc matched, skip 4b (the standalone doc from 4a is the deliverable).
 
-**Look up the meeting doc:**
+**Look up the meeting doc** (if not already resolved in Step 3):
 
 1. **Check config.json first:** look for a matching key in `meeting_docs` (case-insensitive). If found, extract the doc ID from the URL and use it.
 
@@ -235,11 +200,10 @@ python3 ~/.claude/skills/summarise-granola/scripts/add_summary_link.py \
   --url "<standalone_summary_doc_url>"
 ```
 
-This calls a Google Apps Script web app that inserts a hyperlinked date at the top of the "Meeting recording summaries" tab using the Docs API. Returns `{"success": true}` on success or `{"error": "..."}` on failure.
+Inserts a hyperlinked date at the top of the "Meeting recording summaries" tab. Returns `{"success": true}` or `{"error": "..."}`.
 
-**If `meeting_doc_link_webapp_url` isn't configured** (script exits with that error), tell the user the standalone summary doc URL from 4a is available and they can paste it into the meeting doc manually if they like. Skip the rest of 4b.
-
-**If the tab doesn't exist yet**, the script will return an error. In that case, tell the user to add the link manually or create the "Meeting recording summaries" tab in their meeting doc first.
+- If `meeting_doc_link_webapp_url` isn't configured (script exits with that error), tell the user the standalone doc URL from 4a is available to paste manually, and skip the rest of 4b.
+- If the tab doesn't exist yet, the script returns an error — tell the user to add the link manually or create the "Meeting recording summaries" tab first.
 
 **Step 4c: Record the Google Doc URL**
 
@@ -312,25 +276,43 @@ When reporting the files saved, always use **full expanded paths** (not relative
 1. **Google Doc link** (if Step 4 ran) — the Google Doc URL from Step 4c. For 1:1s where the meeting doc was opened, note that the summary content is ready to paste. For standalone docs, note the doc was created and is shareable.
 2. **Files saved** — full absolute path of the summary in the project folder (if project association happened) and in the skill's data directory.
 3. **Auto-association note** (when applicable) — e.g. `Auto-associated with **Acme Consulting** (Jane Smith is registered to this project)`
-4. **Tidied transcript note** (only if selected) — e.g. `Tidied transcript is generating in the background and will be saved to [paths] when done.`
+
+(The tidied-transcript note isn't reported here — that option is chosen in Step 7 and reported when the agent launches in Step 8.)
 
 **Do NOT run `open` on any markdown files.** The user's system opens them in VS Code, which is unwanted. The full paths in the report are already clickable in the terminal.
 
-### Step 7: Send call notes (email or Slack DM)
+### Step 7: Ask about sharing, then send (the only interactive step)
 
-**Skip this step** if the user didn't select email or Slack DM in Step 3.5 (or if this is a group meeting / meeting without a clear person name).
+This is the fast, final decision — by now the summary, the Google Doc, and the meeting-doc link are all done. **Skip this step entirely** for group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions; you've already reported in Step 6, so just stop.
 
-**Step 7a: Check for early answer or ask now**
+**Step 7a: Ask sharing options**
 
-If the sharing question was already asked in Step 3.5 (and the user has answered), use that answer. If it wasn't asked yet (e.g., participant names were unclear at Step 2.5), ask now using AskUserQuestion with `multiSelect: true`:
+Use AskUserQuestion with `multiSelect: true`:
 
-- **"Send call notes email to [Person Name]"** — always show for 1:1 calls
+- **"Send call notes email to [Person Name]"** — always show for 1:1 calls (creates a Gmail draft)
 - **"Send call notes Slack DM to [Person Name]"** — always show for 1:1 calls
-- **"Skip"** — always show
+- **"Create tidied transcript"** — always show (off by default). Fire-and-forget background agent launched in Step 8; does not block anything.
+- **"Skip"** — always show; it's the default when the user is shown the options and submits an empty response.
 
-If the user selects only "Skip", stop here.
+**Codex fallback:** If `AskUserQuestion` or multi-select questions are unavailable, ask this as a normal chat message and STOP until the user answers. For 1:1 calls, do not treat silence or lack of tool support as "Skip".
 
-**Step 7b: Send call notes email** (if selected)
+If the user selects only "Skip" (no email, Slack, or tidied transcript), you're done.
+
+**Step 7b: If email or Slack was selected, ask about comment and auto-send**
+
+Ask two follow-up questions in a single AskUserQuestion call so the send can run unattended:
+
+Question 1 — **Comment** (single-select):
+- **"No comment"**
+- **"Add a comment"** — the user types the comment via the free-text option
+
+Question 2 — **Approval** (single-select):
+- **"Auto-send when ready"** — skip the preview/confirmation and send immediately
+- **"Show preview first"** — show a preview and wait for explicit confirmation before sending
+
+**If the user picks "Auto-send when ready", do NOT ask for confirmation again in Steps 7c or 7d — just send.** The user has pre-authorised the send.
+
+**Step 7c: Send call notes email** (if selected)
 
 **a) Find the attendee's email address:**
 
@@ -339,13 +321,7 @@ If the user selects only "Skip", stop here.
 3. If Gmail search doesn't find a match, ask the user for the email address.
 4. Once an email is obtained (from Gmail or the user), save it to the person's `email` field in `data/people.json` for future use.
 
-**b) Comment:**
-
-Use the comment answer collected in Step 3.5b. Do NOT ask again. If Step 3.5b was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion:
-
-> "Would you like to add a comment to the call notes email?"
-
-- Provide a "No comment" option and a free-text "Add a comment" option
+**b) Comment:** use the comment answer collected in Step 7b. Do NOT ask again.
 
 **c) Create the email using Gmail MCP:**
 
@@ -379,10 +355,10 @@ Use the Gmail MCP `create_draft` tool to create a draft email:
 Use the Google Doc URL from Step 4c (either the existing meeting doc or the newly created standalone doc). If no Google Doc was created, paste the summary content inline in the email body.
 
 **Approval behaviour:**
-- If the user selected **"Auto-send when ready"** in Step 3.5b, create the draft and tell the user it's ready to send in Gmail.
+- If the user selected **"Auto-send when ready"** in Step 7b, create the draft and tell the user it's ready to send in Gmail.
 - Otherwise, show the user a preview of the email and ask for confirmation before creating the draft.
 
-**Step 7c: Send call notes via Slack DM** (if selected)
+**Step 7d: Send call notes via Slack DM** (if selected)
 
 1. **Find the person's Slack DM channel:**
    - Check `data/people.json` for a `slack_dm_channel` field on the person's entry
@@ -392,7 +368,7 @@ Use the Google Doc URL from Step 4c (either the existing meeting doc or the newl
    - **Full name verification (CRITICAL):** Match against full name, NOT just first name. The person's full name from the meeting title must exactly match a workspace member's name. If no exact full-name match is found, do NOT proceed — ask the user to identify the correct person. This prevents sending messages to the wrong person when multiple users share a first name.
    - Cache the channel details in `data/people.json` under the person's `slack_dm_channel` field for future use
 
-2. **Comment:** use the comment answer collected in Step 3.5b. Do NOT ask again. If Step 3.5b was skipped (e.g., names were unclear earlier), ask now using AskUserQuestion: "Would you like to add a comment to the Slack DM?" with a "No comment" option and a free-text "Add a comment" option.
+2. **Comment:** use the comment answer collected in Step 7b. Do NOT ask again.
 
 3. **Compose message** using Slack mrkdwn formatting — keep it brief (no greeting or sign-off):
    - **Without comment:**
@@ -409,7 +385,7 @@ Use the Google Doc URL from Step 4c (either the existing meeting doc or the newl
      ```
 
 4. **Approval behaviour:**
-   - If the user selected **"Auto-send when ready"** in Step 3.5b, skip the preview/confirmation and send immediately.
+   - If the user selected **"Auto-send when ready"** in Step 7b, skip the preview/confirmation and send immediately.
    - Otherwise, **show preview and ask for confirmation** before sending. The preview MUST show the recipient's full Slack profile name (e.g., "Send to **Jane Smith**?"). If the Slack profile name differs from the expected name from the meeting title, flag this explicitly as a potential mismatch.
 
 5. **Send via Slack** using the Slack MCP `slack_send_message` tool with the channel ID and composed message.
@@ -418,16 +394,16 @@ Use the Google Doc URL from Step 4c (either the existing meeting doc or the newl
 
 ### Step 8: Launch tidied transcript agent (background, fire-and-forget)
 
-**Skip this step** if the user did not select "Create tidied transcript" in Step 3.5.
+**Skip this step** if the user did not select "Create tidied transcript" in Step 7a.
 
-Launch with `Agent(model: "sonnet", run_in_background: true)`. This is the last thing you do — the Google Doc is saved and Slack/email are already sent. When the agent finishes later, its completion notification can be acknowledged with a one-liner (e.g. "Tidied transcript saved to X.").
+Launch with `Agent(model: "sonnet", run_in_background: true)`. This is the last thing you do — the Google Doc is saved and Slack/email are already sent. On launch, tell the user the tidied transcript is generating in the background and will be saved to [paths] when done. When the agent finishes later, acknowledge its completion notification with a one-liner (e.g. "Tidied transcript saved to X.").
 
 **Agent prompt (must be self-contained — the agent has no access to this skill file):**
 
 Before launching, `Read` `references/tidying-instructions.md` and paste its contents verbatim into the prompt.
 
 Include:
-1. The **full raw transcript text** (paste inline from `data/transcripts/{slug}.md`).
+1. The **absolute path to the raw transcript** (`data/transcripts/{slug}.md` — the `saved_to` value from Step 2) plus an explicit instruction to `Read` that file itself. **Do not paste the transcript body** — the agent reads it from disk, keeping the large transcript out of the orchestrator's context.
 2. The **confirmed participant names** from Step 2.5.
 3. Instruction to write the tidied transcript to: `~/.claude/skills/summarise-granola/data/tidied-transcripts/{slug}--transcript.md` (create the directory with `mkdir -p`).
 4. If a project folder was determined in Step 5, also instruct the agent to copy the final file to: `~/Documents/Projects/{folder}/calls/transcripts/{slug}--transcript.md` (after creating the parent directory with `mkdir -p`).
@@ -505,8 +481,8 @@ The registry at `~/.claude/skills/summarise-granola/data/people.json` stores met
 **Fields:**
 - `full_name` — display name
 - `initials` — lowercase initials for doc lookup (e.g., "js", "ab")
-- `email` — email address for sending call notes (Step 7b), or `null`
-- `slack_dm_channel` — Slack DM details for sending call notes (Step 7c), or `null`. Object with `channel_id`, `workspace`, and `slack_connect` (boolean)
+- `email` — email address for sending call notes (Step 7c), or `null`
+- `slack_dm_channel` — Slack DM details for sending call notes (Step 7d), or `null`. Object with `channel_id`, `workspace`, and `slack_connect` (boolean)
 - `default_project` — project folder name for auto-association (Step 5), or `null`
 - `meeting_doc` — Google Doc reference for call summaries (Step 4), or `null`
 
