@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Granola transcript extraction utility.
+Granola transcript extraction utility (MCP-backed).
 
 Usage:
     python granola.py check             # Check for recent call or list 5 most recent
@@ -9,382 +9,274 @@ Usage:
     python granola.py recent [n]        # Get transcript for nth most recent meeting (default: 1)
 
 Transcripts are automatically saved to the data/transcripts/ folder.
+
+--- How this works (changed 2026-07-17) ---
+Granola v7.427+ moved its local data-encryption key into the macOS
+data-protection keychain (access group QZ7DHHLN25.granola), readable only by
+Granola's own code-signed binary. That permanently broke the previous approach
+of decrypting Granola's local token store and calling the private api.granola.ai
+endpoints directly.
+
+Instead we now talk to Granola's official hosted MCP server
+(https://mcp.granola.ai/mcp), reusing the OAuth token that Claude Code stores
+after the user authorises the `granola` connector (`claude mcp add ... granola`
+then `/mcp` to authenticate). The token lives in the macOS keychain item
+"Claude Code-credentials" under mcpOAuth. Claude Code refreshes it on session
+start, so reading it fresh per invocation is normally valid.
+
+MCP tools used:
+    list_meetings          -> recent meeting list (titles, ids, dates)
+    get_meeting_transcript -> verbatim transcript for one meeting
+    get_meetings           -> meeting metadata (used here only for the date)
 """
 
-import base64
-import hashlib
 import json
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-GRANOLA_DIR = Path.home() / "Library" / "Application Support" / "Granola"
-STORED_ACCOUNTS = GRANOLA_DIR / "stored-accounts.json"
-SUPABASE_AUTH = GRANOLA_DIR / "supabase.json"
-# Granola 7.2x+ encrypts the token store. The plaintext files above are left
-# stale by newer builds; the live tokens now live in these .enc files, which are
-# AES-256-GCM-encrypted with a data encryption key (DEK) wrapped in storage.dek.
-STORED_ACCOUNTS_ENC = GRANOLA_DIR / "stored-accounts.json.enc"
-SUPABASE_AUTH_ENC = GRANOLA_DIR / "supabase.json.enc"
-DEK_FILE = GRANOLA_DIR / "storage.dek"
-# macOS Keychain service holding the Electron safeStorage key that wraps the DEK.
-KEYCHAIN_SERVICE = "Granola Safe Storage"
-API_BASE = "https://api.granola.ai/v1"
 SKILL_DIR = Path(__file__).parent.parent
 TRANSCRIPTS_DIR = SKILL_DIR / "data" / "transcripts"
-SUMMARIES_DIR = SKILL_DIR / "data" / "summaries"
 
-# Granola's API rejects requests without a client-version header ("Unsupported
-# client"). The desktop app sends its own version; we mirror a known-good one.
-# Bump this if Granola starts rejecting the value.
-GRANOLA_CLIENT_VERSION = "7.162.2"
+MCP_URL = "https://mcp.granola.ai/mcp"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+# macOS keychain item where Claude Code stores its credentials (incl. MCP OAuth).
+KEYCHAIN_CRED_SERVICE = "Claude Code-credentials"
 
-# How recent a call must be to auto-summarise (in minutes)
+# How recent a call must be (since it started) to auto-summarise, in minutes.
 RECENT_THRESHOLD_MINUTES = 30
+# Window used when listing "recent" meetings via the MCP.
+RECENT_WINDOW_DAYS = 30
 
 
-def _parse_stored_accounts(data: dict) -> dict | None:
-    """Extract tokens from a parsed stored-accounts payload (plaintext or decrypted)."""
-    accounts_raw = data.get('accounts')
-    if not accounts_raw:
-        return None
-    accounts = json.loads(accounts_raw) if isinstance(accounts_raw, str) else accounts_raw
-    if not accounts:
-        return None
-    tokens_raw = accounts[0].get('tokens')
-    if not tokens_raw:
-        return None
-    return json.loads(tokens_raw) if isinstance(tokens_raw, str) else tokens_raw
+# --------------------------------------------------------------------------- #
+# MCP transport
+# --------------------------------------------------------------------------- #
 
+def _granola_token() -> str:
+    """Read the granola MCP OAuth access token from Claude Code's keychain item.
 
-def _parse_supabase(data: dict) -> dict | None:
-    """Extract tokens from a parsed supabase payload (plaintext or decrypted)."""
-    return json.loads(data['workos_tokens'])
-
-
-def _tokens_from_stored_accounts() -> dict | None:
-    """Read tokens from stored-accounts.json (legacy plaintext store)."""
-    if not STORED_ACCOUNTS.exists():
-        return None
-    try:
-        return _parse_stored_accounts(json.load(open(STORED_ACCOUNTS)))
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
-        return None
-
-
-def _tokens_from_supabase() -> dict | None:
-    """Read tokens from supabase.json (legacy plaintext store)."""
-    if not SUPABASE_AUTH.exists():
-        return None
-    try:
-        return _parse_supabase(json.load(open(SUPABASE_AUTH)))
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return None
-
-
-def _aes_cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes:
-    """AES-CBC decrypt, preferring `cryptography`, falling back to pycryptodome."""
-    try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        d = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
-        return d.update(ct) + d.finalize()
-    except ImportError:
-        from Crypto.Cipher import AES
-        return AES.new(key, AES.MODE_CBC, iv).decrypt(ct)
-
-
-def _aes_gcm_decrypt(key: bytes, nonce: bytes, ct: bytes, tag: bytes) -> bytes:
-    """AES-GCM decrypt+verify, preferring `cryptography`, falling back to pycryptodome."""
-    try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        return AESGCM(key).decrypt(nonce, ct + tag, None)
-    except ImportError:
-        from Crypto.Cipher import AES
-        return AES.new(key, AES.MODE_GCM, nonce=nonce).decrypt_and_verify(ct, tag)
-
-
-def _safestorage_decrypt(blob: bytes) -> bytes:
-    """Decrypt an Electron safeStorage blob.
-
-    On macOS this is `v10` + AES-128-CBC, key = PBKDF2-HMAC-SHA1(keychain_pw,
-    "saltysalt", 1003, 16), IV = 16 spaces. Raises on any failure (e.g. the user
-    declining the Keychain access prompt)."""
+    Claude Code stores per-server OAuth tokens under mcpOAuth, keyed by
+    "<serverName>|<hash>". We match the entry whose name is "granola"."""
     out = subprocess.run(
-        ["security", "find-generic-password", "-ws", KEYCHAIN_SERVICE],
-        capture_output=True, text=True, timeout=30,
+        ["security", "find-generic-password", "-s", KEYCHAIN_CRED_SERVICE, "-w"],
+        capture_output=True, text=True,
     )
     if out.returncode != 0 or not out.stdout.strip():
-        raise RuntimeError(f"Keychain lookup failed for {KEYCHAIN_SERVICE!r}")
-    pw = out.stdout.strip()
-    key = hashlib.pbkdf2_hmac("sha1", pw.encode("utf-8"), b"saltysalt", 1003, 16)
-    if blob[:3] in (b"v10", b"v11"):
-        blob = blob[3:]
-    dec = _aes_cbc_decrypt(key, b" " * 16, blob)
-    pad = dec[-1]
-    if 1 <= pad <= 16:
-        dec = dec[:-pad]
-    return dec
-
-
-def _unwrap_dek() -> bytes | None:
-    """Return the 32-byte data encryption key stored (wrapped) in storage.dek."""
-    if not DEK_FILE.exists():
-        return None
-    dek = base64.b64decode(_safestorage_decrypt(DEK_FILE.read_bytes()).decode("utf-8"))
-    return dek if len(dek) == 32 else None
-
-
-def _decrypt_enc_file(path: Path, dek: bytes) -> str:
-    """Decrypt a Granola *.enc payload: [iv:12][ciphertext][tag:16], AES-256-GCM."""
-    data = path.read_bytes()
-    iv, tag, ct = data[:12], data[-16:], data[12:-16]
-    return _aes_gcm_decrypt(dek, iv, ct, tag).decode("utf-8")
-
-
-def _tokens_from_encrypted() -> dict | None:
-    """Decrypt the encrypted token store (Granola 7.2x+) and extract tokens.
-
-    Returns None (rather than raising) on any failure so callers can fall back
-    to the legacy plaintext stores."""
-    try:
-        dek = _unwrap_dek()
-    except Exception:
-        return None
-    if not dek:
-        return None
-    for path, parser in ((STORED_ACCOUNTS_ENC, _parse_stored_accounts),
-                         (SUPABASE_AUTH_ENC, _parse_supabase)):
-        if not path.exists():
-            continue
-        try:
-            tokens = parser(json.loads(_decrypt_enc_file(path, dek)))
-            if tokens and 'access_token' in tokens:
-                return tokens
-        except Exception:
-            continue
-    return None
-
-
-def get_access_token() -> str:
-    """Read the Granola access token.
-
-    Prefers the encrypted store (Granola 7.2x+ keeps the live token there and
-    leaves the plaintext files stale), then falls back to the legacy plaintext
-    stored-accounts.json / supabase.json for older builds."""
-    tokens = (
-        _tokens_from_encrypted()
-        or _tokens_from_stored_accounts()
-        or _tokens_from_supabase()
-    )
-    if not tokens or 'access_token' not in tokens:
         print(
-            f"Error: Could not read Granola tokens from {GRANOLA_DIR}.\n"
-            "Tried the encrypted store (stored-accounts.json.enc) and the legacy\n"
-            "plaintext files. Is Granola installed and signed in? If decryption is\n"
-            "failing, ensure the `cryptography` (or `pycryptodome`) package is available\n"
-            "and that you allowed the Keychain access prompt.",
+            "Error: Could not read Claude Code credentials from the macOS keychain.\n"
+            "Is the Granola MCP connector set up? Run:\n"
+            "  claude mcp add --transport http --scope user granola https://mcp.granola.ai/mcp\n"
+            "then start `claude` and run /mcp to authenticate.",
             file=sys.stderr,
         )
         sys.exit(1)
-    return tokens['access_token']
-
-
-def api_call(endpoint: str, payload: dict) -> any:
-    """Make an authenticated POST request to the Granola API."""
-    token = get_access_token()
-
-    result = subprocess.run(
-        [
-            'curl', '-s', '--compressed', '-X', 'POST',
-            f'{API_BASE}/{endpoint}',
-            '-H', f'Authorization: Bearer {token}',
-            '-H', 'Content-Type: application/json',
-            '-H', f'X-Client-Version: {GRANOLA_CLIENT_VERSION}',
-            '-d', json.dumps(payload),
-        ],
-        capture_output=True, text=True,
-    )
-
-    if result.returncode != 0:
-        print(f"Error: API call failed: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-
     try:
-        parsed = json.loads(result.stdout)
+        creds = json.loads(out.stdout)
     except json.JSONDecodeError:
-        print(f"Error: Invalid JSON response: {result.stdout[:200]}", file=sys.stderr)
+        print("Error: Claude Code credential blob was not valid JSON.", file=sys.stderr)
         sys.exit(1)
 
-    # Granola returns errors as {"message": "..."} with HTTP 200; surface them.
-    if isinstance(parsed, dict) and set(parsed.keys()) == {'message'}:
-        msg = parsed['message']
-        hint = ""
-        if msg == "Unauthorized":
-            hint = " (token may be expired — open Granola.app to refresh)"
-        elif msg == "Unsupported client":
-            hint = f" (bump GRANOLA_CLIENT_VERSION in {Path(__file__).name})"
-        print(f"Error: Granola API: {msg}{hint}", file=sys.stderr)
+    mcp_oauth = creds.get("mcpOAuth") or {}
+    for key, info in mcp_oauth.items():
+        # Keys look like "granola|<16-hex-char hash>".
+        if key.split("|", 1)[0].lower() == "granola" and isinstance(info, dict):
+            token = info.get("accessToken") or info.get("access_token")
+            if token:
+                return token
+    print(
+        "Error: No authenticated `granola` MCP connector found in Claude Code.\n"
+        "Start `claude`, run /mcp, select granola and authenticate, then retry.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def _mcp_request(method: str, params: dict | None, _id: int) -> list[dict]:
+    """POST a single JSON-RPC message to the MCP server and parse the reply.
+
+    The server is stateless and answers over either application/json or an SSE
+    (text/event-stream) body; both are handled here."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Authorization": f"Bearer {_granola_token()}",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    }
+    body = {"jsonrpc": "2.0", "id": _id, "method": method}
+    if params is not None:
+        body["params"] = params
+    req = urllib.request.Request(
+        MCP_URL, data=json.dumps(body).encode(), headers=headers, method="POST"
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=90)
+        raw = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print(
+                "Error: Granola MCP returned 401 (token expired or revoked).\n"
+                "The token refreshes when Claude Code restarts; start a new `claude`\n"
+                "session, or run /mcp to re-authenticate the granola connector.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Error: Granola MCP HTTP {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001 - surface transport failures plainly
+        print(f"Error: Granola MCP request failed: {e}", file=sys.stderr)
         sys.exit(1)
 
-    return parsed
+    messages: list[dict] = []
+    if "data:" in raw:
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                try:
+                    messages.append(json.loads(line[5:].strip()))
+                except json.JSONDecodeError:
+                    pass
+    elif raw.strip():
+        messages.append(json.loads(raw))
+    return messages
+
+
+def mcp_tool(name: str, arguments: dict) -> str:
+    """Call an MCP tool and return its concatenated text content."""
+    # The server is stateless, but still expects an initialize before use.
+    _mcp_request(
+        "initialize",
+        {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "summarise-granola", "version": "2"},
+        },
+        0,
+    )
+    messages = _mcp_request("tools/call", {"name": name, "arguments": arguments}, 1)
+    for m in messages:
+        if "error" in m:
+            print(f"Error: Granola MCP tool '{name}': {json.dumps(m['error'])}", file=sys.stderr)
+            sys.exit(1)
+        if "result" in m:
+            parts = [
+                c.get("text", "")
+                for c in m["result"].get("content", [])
+                if c.get("type") == "text"
+            ]
+            return "\n".join(parts)
+    print(f"Error: Granola MCP tool '{name}' returned no result.", file=sys.stderr)
+    sys.exit(1)
+
+
+# --------------------------------------------------------------------------- #
+# Parsing helpers
+# --------------------------------------------------------------------------- #
+
+_MEETING_RE = re.compile(r'<meeting\s+id="([^"]+)"\s+title="(.*?)"\s+date="([^"]+)">', re.DOTALL)
+_DATE_RE = re.compile(r"^(.*?)\s*(?:GMT([+-]\d+))?$")
 
 
 def slugify(text: str) -> str:
     """Convert text to a filename-safe slug."""
-    text = text.replace('&', 'and')
-    text = re.sub(r'[^a-z0-9]+', '-', text.lower())
-    text = text.strip('-')
+    text = text.replace("&", "and")
+    text = re.sub(r"[^a-z0-9]+", "-", text.lower())
+    text = text.strip("-")
     return text[:50]
 
 
-def parse_iso_timestamp(ts: str) -> datetime:
-    """Parse ISO timestamp string to datetime."""
-    ts = ts.replace('Z', '+00:00')
+def parse_granola_date(date_str: str) -> datetime | None:
+    """Parse a Granola display date like 'Jul 17, 2026 2:16 PM GMT+1'."""
+    m = _DATE_RE.match(date_str.strip())
+    if not m:
+        return None
+    front, offset = m.group(1).strip(), m.group(2)
     try:
-        return datetime.fromisoformat(ts)
+        dt = datetime.strptime(front, "%b %d, %Y %I:%M %p")
     except ValueError:
-        return datetime.min.replace(tzinfo=timezone.utc)
+        try:
+            dt = datetime.strptime(front, "%b %d, %Y")
+        except ValueError:
+            return None
+    tz = timezone(timedelta(hours=int(offset))) if offset else timezone.utc
+    return dt.replace(tzinfo=tz)
 
 
-def _effective_timestamp(doc: dict) -> str:
-    """Return the most recent activity timestamp for a doc.
-
-    Granola pre-creates documents for recurring calendar events, so ``created_at``
-    can point to when the series was first scheduled rather than when the call
-    actually happened. ``updated_at`` tracks the most recent edit (including
-    transcript ingestion), so it is a better proxy for "when did this meeting
-    really take place".
-    """
-    return doc.get('updated_at') or doc.get('created_at') or ''
+def iso_date(date_str: str) -> str:
+    """Return a YYYY-MM-DD string from a Granola display date."""
+    dt = parse_granola_date(date_str)
+    return dt.date().isoformat() if dt else "unknown-date"
 
 
-def get_recent_documents(limit: int = 5) -> list[dict]:
-    """Fetch recent documents from the Granola API, sorted by most-recent activity."""
-    # Fetch a larger window than ``limit`` so the updated_at re-sort has room to
-    # surface docs that were created earlier but updated today.
-    docs = api_call('get-documents', {'limit': max(limit * 4, 30)})
-    if not isinstance(docs, list):
-        print(f"Error: Unexpected API response format", file=sys.stderr)
+def list_recent_meetings(limit: int) -> list[dict]:
+    """Return recent meetings (most recent first) as dicts: id, title, date."""
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=RECENT_WINDOW_DAYS)).date().isoformat()
+    end = (now + timedelta(days=1)).date().isoformat()
+    text = mcp_tool(
+        "list_meetings",
+        {"time_range": "custom", "custom_start": start, "custom_end": end},
+    )
+    meetings = [
+        {"id": mid, "title": title, "date": date}
+        for mid, title, date in _MEETING_RE.findall(text)
+    ]
+    return meetings[:limit]
+
+
+def meeting_date_for(doc_id: str) -> str:
+    """Fetch a single meeting's display date via get_meetings (for the filename)."""
+    text = mcp_tool("get_meetings", {"meeting_ids": [doc_id]})
+    m = _MEETING_RE.search(text)
+    return m.group(3) if m else ""
+
+
+def _extract_transcript_json(text: str) -> dict:
+    """Pull the JSON object out of a get_meeting_transcript response.
+
+    The response is prefixed with a plain-text guard line, then a JSON object."""
+    brace = text.find("{")
+    if brace == -1:
+        print("Error: transcript response contained no JSON.", file=sys.stderr)
         sys.exit(1)
-    docs.sort(key=_effective_timestamp, reverse=True)
-    return docs[:limit]
-
-
-def check_recent():
-    """
-    Check if there's a recent call (within 30 minutes).
-
-    If yes, output JSON indicating auto-summarise mode.
-    If no, output a numbered list of the 5 most recent calls for selection.
-    """
-    docs = get_recent_documents(limit=5)
-
-    if not docs:
-        print("No meetings found.")
-        return
-
-    # Check if most recent meeting was active within threshold
-    most_recent = docs[0]
-    effective_ts = _effective_timestamp(most_recent)
-
-    if effective_ts:
-        meeting_time = parse_iso_timestamp(effective_ts)
-        now = datetime.now(timezone.utc)
-        minutes_ago = (now - meeting_time).total_seconds() / 60
-
-        if minutes_ago <= RECENT_THRESHOLD_MINUTES:
-            result = {
-                'mode': 'auto',
-                'id': most_recent['id'],
-                'title': most_recent.get('title', 'Untitled'),
-                'minutes_ago': round(minutes_ago, 1),
-            }
-            print(json.dumps(result))
-            return
-
-    # No recent call - show selection list
-    result = {
-        'mode': 'select',
-        'meetings': [],
-    }
-
-    for i, doc in enumerate(docs, 1):
-        effective = _effective_timestamp(doc)
-        date_str = effective[:10] if effective else 'Unknown'
-        result['meetings'].append({
-            'number': i,
-            'id': doc['id'],
-            'title': doc.get('title', 'Untitled'),
-            'date': date_str,
-        })
-
-    print(json.dumps(result))
-
-
-def list_meetings():
-    """List recent meetings."""
-    docs = get_recent_documents(limit=20)
-
-    print(f"Found {len(docs)} recent meeting(s):\n")
-    for i, doc in enumerate(docs, 1):
-        effective = _effective_timestamp(doc)
-        date_str = effective[:10] if effective else 'Unknown date'
-        print(f"{i}. [{date_str}] {doc.get('title', 'Untitled')}")
-        print(f"   ID: {doc['id']}")
-        print()
-
-
-def build_transcript(doc_id: str) -> tuple[str, str, str]:
-    """
-    Fetch and build transcript markdown for a specific document.
-
-    Returns:
-        tuple: (markdown_content, title, date_str)
-    """
-    # Fetch document metadata
-    docs_response = api_call('get-documents-batch', {'document_ids': [doc_id]})
-    if isinstance(docs_response, dict) and 'docs' in docs_response:
-        docs_list = docs_response['docs']
-    elif isinstance(docs_response, list):
-        docs_list = docs_response
-    else:
-        docs_list = []
-    doc = docs_list[0] if docs_list else {}
-
-    title = doc.get('title', 'Untitled')
-    effective = _effective_timestamp(doc)
-    date_str = effective[:10] if effective else 'unknown-date'
-
-    # Fetch transcript chunks
-    chunks = api_call('get-document-transcript', {'document_id': doc_id})
-
-    if not isinstance(chunks, list) or len(chunks) == 0:
-        print(f"Error: No transcript found for document ID: {doc_id}", file=sys.stderr)
+    try:
+        return json.loads(text[brace:])
+    except json.JSONDecodeError:
+        print("Error: could not parse transcript JSON.", file=sys.stderr)
         sys.exit(1)
 
-    # Sort by timestamp
-    chunks.sort(key=lambda c: c.get('start_timestamp', ''))
 
-    lines = []
-    lines.append(f"# {title}")
-    lines.append(f"Date: {date_str}")
-    lines.append("")
+# Turn boundaries: the label 'Microphone'/'Speaker' (always) or a capitalised
+# name label preceded by 2+ spaces (Granola separates turns with a double space).
+_TURN_RE = re.compile(
+    r"(?:^\s*|\s{2,})(Microphone|Speaker|[A-Z][\w.'’-]*(?:\s[A-Z][\w.'’-]*){0,3})\s*:\s+"
+)
 
-    # Group consecutive segments by speaker
+
+def format_transcript(transcript: str) -> str:
+    """Turn Granola's inline-labelled transcript string into speaker turns.
+
+    'Microphone' (the note-taker's own audio) maps to **Me**; every other label
+    ('Speaker' or a named participant) maps to **Other**, matching the format the
+    rest of the skill expects."""
+    boundaries = list(_TURN_RE.finditer(transcript))
+    turns: list[tuple[str, str]] = []
+    for i, match in enumerate(boundaries):
+        label = match.group(1)
+        speaker = "Me" if label.lower() == "microphone" else "Other"
+        text_start = match.end()
+        text_end = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(transcript)
+        text = transcript[text_start:text_end].strip()
+        if text:
+            turns.append((speaker, text))
+
+    # Group consecutive turns by the same speaker.
+    lines: list[str] = []
     current_speaker = None
-    current_text = []
-
-    for chunk in chunks:
-        source = chunk.get('source', 'unknown')
-        text = chunk.get('text', '').strip()
-
-        if not text:
-            continue
-
-        speaker = 'Me' if source == 'microphone' else 'Other'
-
+    current_text: list[str] = []
+    for speaker, text in turns:
         if speaker != current_speaker:
             if current_text:
                 lines.append(f"**{current_speaker}**: {' '.join(current_text)}")
@@ -393,23 +285,84 @@ def build_transcript(doc_id: str) -> tuple[str, str, str]:
             current_text = [text]
         else:
             current_text.append(text)
-
     if current_text:
         lines.append(f"**{current_speaker}**: {' '.join(current_text)}")
+    return "\n".join(lines)
 
-    return '\n'.join(lines), title, date_str
+
+def build_transcript(doc_id: str) -> tuple[str, str, str]:
+    """Fetch and build transcript markdown for a specific meeting.
+
+    Returns (markdown_content, title, date_str)."""
+    text = mcp_tool("get_meeting_transcript", {"meeting_id": doc_id})
+    data = _extract_transcript_json(text)
+
+    title = data.get("title", "Untitled")
+    transcript = (data.get("transcript") or "").strip()
+    if not transcript:
+        print(f"Error: No transcript found for meeting ID: {doc_id}", file=sys.stderr)
+        sys.exit(1)
+
+    date_str = iso_date(meeting_date_for(doc_id))
+
+    body = format_transcript(transcript)
+    markdown = f"# {title}\nDate: {date_str}\n\n{body}"
+    return markdown, title, date_str
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+
+def check_recent():
+    """Check for a recent call (auto mode) or list the 5 most recent (select mode)."""
+    meetings = list_recent_meetings(limit=5)
+    if not meetings:
+        print("No meetings found.")
+        return
+
+    most_recent = meetings[0]
+    dt = parse_granola_date(most_recent["date"])
+    if dt:
+        minutes_ago = (datetime.now(timezone.utc) - dt).total_seconds() / 60
+        if 0 <= minutes_ago <= RECENT_THRESHOLD_MINUTES:
+            print(json.dumps({
+                "mode": "auto",
+                "id": most_recent["id"],
+                "title": most_recent["title"] or "Untitled",
+                "minutes_ago": round(minutes_ago, 1),
+            }))
+            return
+
+    result = {"mode": "select", "meetings": []}
+    for i, mtg in enumerate(meetings, 1):
+        result["meetings"].append({
+            "number": i,
+            "id": mtg["id"],
+            "title": mtg["title"] or "Untitled",
+            "date": iso_date(mtg["date"]),
+        })
+    print(json.dumps(result))
+
+
+def list_meetings_cmd():
+    """List recent meetings in a human-readable form."""
+    meetings = list_recent_meetings(limit=20)
+    print(f"Found {len(meetings)} recent meeting(s):\n")
+    for i, mtg in enumerate(meetings, 1):
+        print(f"{i}. [{iso_date(mtg['date'])}] {mtg['title'] or 'Untitled'}")
+        print(f"   ID: {mtg['id']}")
+        print()
 
 
 def get_transcript(doc_id: str):
-    """Get and save the full transcript for a specific document."""
+    """Get and save the full transcript for a specific meeting."""
     markdown, title, date_str = build_transcript(doc_id)
 
     TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-
     filename = f"{date_str}-{slugify(title or 'untitled')}.md"
     filepath = TRANSCRIPTS_DIR / filename
-
-    with open(filepath, 'w') as f:
+    with open(filepath, "w") as f:
         f.write(markdown)
 
     # Print only the path + metadata, never the transcript body: the body is
@@ -425,14 +378,11 @@ def get_transcript(doc_id: str):
 
 def get_recent_transcript(n: int = 1):
     """Get transcript for the nth most recent meeting."""
-    docs = get_recent_documents(limit=max(n, 5))
-
-    if n < 1 or n > len(docs):
-        print(f"Error: Only {len(docs)} meeting(s) available", file=sys.stderr)
+    meetings = list_recent_meetings(limit=max(n, 5))
+    if n < 1 or n > len(meetings):
+        print(f"Error: Only {len(meetings)} meeting(s) available", file=sys.stderr)
         sys.exit(1)
-
-    doc_id = docs[n - 1]['id']
-    get_transcript(doc_id)
+    get_transcript(meetings[n - 1]["id"])
 
 
 def main():
@@ -441,17 +391,16 @@ def main():
         sys.exit(1)
 
     command = sys.argv[1]
-
-    if command == 'check':
+    if command == "check":
         check_recent()
-    elif command == 'list':
-        list_meetings()
-    elif command == 'get':
+    elif command == "list":
+        list_meetings_cmd()
+    elif command == "get":
         if len(sys.argv) < 3:
             print("Error: Document ID required", file=sys.stderr)
             sys.exit(1)
         get_transcript(sys.argv[2])
-    elif command == 'recent':
+    elif command == "recent":
         n = int(sys.argv[2]) if len(sys.argv) > 2 else 1
         get_recent_transcript(n)
     else:
@@ -460,5 +409,5 @@ def main():
         sys.exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

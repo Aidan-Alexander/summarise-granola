@@ -13,13 +13,18 @@ The skill reads per-user settings from `config.json` in the skill directory (`~/
 
 **On first run** (if `config.json` doesn't exist), run setup before proceeding to Step 1:
 
-1. Ask: "What's your first name? (Used in summaries and email sign-offs)"
+1. Verify the Granola connection: run `python3 ~/.claude/skills/summarise-granola/scripts/granola.py check`. If it errors about a missing or unauthenticated `granola` connector, walk the user through connecting it:
+   - Run `claude mcp add --transport http --scope user granola https://mcp.granola.ai/mcp` for them.
+   - Tell them to start a new Claude Code session, run `/mcp`, select `granola`, and sign in when the browser opens (OAuth — only they can do this part).
+   - Once they've authenticated, re-run the check to confirm it works, then continue setup from where you left off.
 
-2. Ask: "Do you have 1:1 meeting docs in Google Docs where you'd like call summaries automatically linked? If so, I can set that up now — otherwise you can add them later or skip entirely." Provide options:
+2. Ask: "What's your first name? (Used in summaries and email sign-offs)"
+
+3. Ask: "Do you have 1:1 meeting docs in Google Docs where you'd like call summaries automatically linked? If so, I can set that up now — otherwise you can add them later or skip entirely." Provide options:
    - **"Yes, I'll add some now"** — for each person, ask their name and the Google Doc URL, one at a time, until the user says they're done
    - **"Skip for now"** — the skill will create standalone Google Doc summaries instead of linking into meeting docs
 
-3. Write `config.json`:
+4. Write `config.json`:
    ```json
    {
      "user_name": "<name>",
@@ -32,7 +37,7 @@ The skill reads per-user settings from `config.json` in the skill directory (`~/
    ```
    If the user skipped meeting docs, write `"meeting_docs": {}`.
 
-4. Confirm setup is complete. If the user also triggered `/summarise-granola` (i.e., they want to summarise a call now), continue to Step 1. Otherwise, stop.
+5. Confirm setup is complete. If the user also triggered `/summarise-granola` (i.e., they want to summarise a call now), continue to Step 1. Otherwise, stop.
 
 **To add meeting docs later:** the user can edit `config.json` directly, or the skill will offer to save newly discovered meeting docs during Step 4b.
 
