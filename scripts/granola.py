@@ -175,8 +175,31 @@ def mcp_tool(name: str, arguments: dict) -> str:
 # Parsing helpers
 # --------------------------------------------------------------------------- #
 
-_MEETING_RE = re.compile(r'<meeting\s+id="([^"]+)"\s+title="(.*?)"\s+date="([^"]+)">', re.DOTALL)
+# A <meeting ...> opening tag: a run of attr="value" pairs. Matching quoted
+# values as whole units keeps titles containing < or > (e.g. 'Aaron <> Aidan
+# 1:1') from ending the tag early, and tolerates extra or reordered attributes
+# (mid-2026 list_meetings added captured_by_me/listed_as_participant/... after
+# date, which broke matching on a fixed id/title/date sequence).
+_MEETING_TAG_RE = re.compile(r'<meeting\s+((?:[\w-]+="[^"]*"\s*)+)/?>')
+_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
 _DATE_RE = re.compile(r"^(.*?)\s*(?:GMT([+-]\d+))?$")
+
+
+def _parse_meetings(text: str) -> list[dict]:
+    """Extract meetings from a list_meetings/get_meetings response.
+
+    Returns dicts with id, title, date, preserving server order (most recent
+    first)."""
+    meetings = []
+    for m in _MEETING_TAG_RE.finditer(text):
+        attrs = dict(_ATTR_RE.findall(m.group(1)))
+        if attrs.get("id"):
+            meetings.append({
+                "id": attrs["id"],
+                "title": attrs.get("title", ""),
+                "date": attrs.get("date", ""),
+            })
+    return meetings
 
 
 def slugify(text: str) -> str:
@@ -219,18 +242,14 @@ def list_recent_meetings(limit: int) -> list[dict]:
         "list_meetings",
         {"time_range": "custom", "custom_start": start, "custom_end": end},
     )
-    meetings = [
-        {"id": mid, "title": title, "date": date}
-        for mid, title, date in _MEETING_RE.findall(text)
-    ]
-    return meetings[:limit]
+    return _parse_meetings(text)[:limit]
 
 
 def meeting_date_for(doc_id: str) -> str:
     """Fetch a single meeting's display date via get_meetings (for the filename)."""
     text = mcp_tool("get_meetings", {"meeting_ids": [doc_id]})
-    m = _MEETING_RE.search(text)
-    return m.group(3) if m else ""
+    meetings = _parse_meetings(text)
+    return meetings[0]["date"] if meetings else ""
 
 
 def _extract_transcript_json(text: str) -> dict:
@@ -248,24 +267,25 @@ def _extract_transcript_json(text: str) -> dict:
         sys.exit(1)
 
 
-# Turn boundaries: the label 'Microphone'/'Speaker' (always) or a capitalised
-# name label preceded by 2+ spaces (Granola separates turns with a double space).
+# Turn boundaries: the two-sided labels Granola uses ('Me'/'Them' as of
+# mid-2026, 'Microphone'/'Speaker' before that) or a capitalised name label,
+# preceded by 2+ spaces (Granola separates turns with a double space).
 _TURN_RE = re.compile(
-    r"(?:^\s*|\s{2,})(Microphone|Speaker|[A-Z][\w.'’-]*(?:\s[A-Z][\w.'’-]*){0,3})\s*:\s+"
+    r"(?:^\s*|\s{2,})(Me|Them|Microphone|Speaker|[A-Z][\w.'’-]*(?:\s[A-Z][\w.'’-]*){0,3})\s*:\s+"
 )
 
 
 def format_transcript(transcript: str) -> str:
     """Turn Granola's inline-labelled transcript string into speaker turns.
 
-    'Microphone' (the note-taker's own audio) maps to **Me**; every other label
-    ('Speaker' or a named participant) maps to **Other**, matching the format the
-    rest of the skill expects."""
+    'Me' or 'Microphone' (the note-taker's own audio) maps to **Me**; every
+    other label ('Them', 'Speaker', or a named participant) maps to **Other**,
+    matching the format the rest of the skill expects."""
     boundaries = list(_TURN_RE.finditer(transcript))
     turns: list[tuple[str, str]] = []
     for i, match in enumerate(boundaries):
         label = match.group(1)
-        speaker = "Me" if label.lower() == "microphone" else "Other"
+        speaker = "Me" if label.lower() in ("me", "microphone") else "Other"
         text_start = match.end()
         text_end = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(transcript)
         text = transcript[text_start:text_end].strip()
