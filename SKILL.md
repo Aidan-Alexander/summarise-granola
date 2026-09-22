@@ -5,7 +5,7 @@ description: For Granola call or meeting summaries, including "summarise my call
 
 # Granola transcript summarisation
 
-This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, saves it as a standalone Google Doc, and optionally links it from the person's meeting doc. For 1:1 calls where a meeting doc is configured, a link is added to the "Meeting recording summaries" tab (using the meeting date as the link text). For calls with no configured meeting doc, a standalone Google Doc is created for easy sharing. A tidied transcript is opt-in; when created it runs in the background and is appended to the bottom of the summary doc. The skill never sends the summary to the attendee — there is no email or Slack sharing step.
+This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, saves it as a standalone Google Doc, and optionally links it from the person's meeting doc. For 1:1 calls where a meeting doc is configured, a link is added to the "Meeting recording summaries" tab (using the meeting date as the link text). For calls with no configured meeting doc, a standalone Google Doc is created for easy sharing. A tidied transcript is always created: it runs in the background and is appended to the bottom of the summary doc. The skill never sends the summary to the attendee — there is no email or Slack sharing step.
 
 ## Configuration
 
@@ -49,7 +49,7 @@ The skill reads per-user settings from `config.json` in the skill directory (`~/
 
 ## Workflow
 
-**Ordering principle (read this first):** Everything that always happens — generating the summary, creating the standalone Google Doc, and (for 1:1s) linking it into the meeting doc — runs first and needs **no user input**. The only interactive decision, whether to create a tidied transcript, is saved for the **very end** (Step 7). This lets the user trigger the skill, walk away, and come back to find only that quick question waiting. **Never ask it before the summary, the Google Doc, and the meeting-doc link are all done. And never ask about sharing the summary with the attendee (email, Slack DM, or otherwise) — the user never shares call notes.**
+**Ordering principle (read this first):** The whole workflow runs unattended — **there is no closing question and no opt-in step**. Generate the summary, create the standalone Google Doc, link it into the meeting doc (for 1:1s), file it, report, then launch the tidied-transcript agent. The user triggers the skill and walks away; everything is done when they come back. **Never ask about sharing the summary with the attendee (email, Slack DM, or otherwise) — the user never shares call notes.** Two things can still require input, and only when genuinely unresolvable: an ambiguous participant name (Step 2.5), and which project to file an unregistered person's call under (Step 5c). Neither is a closing question — resolve them in place and carry on.
 
 ### Step 1: Check for recent calls
 
@@ -160,7 +160,7 @@ In the **same message as the agent launch**, find the matching meeting doc:
 
 Store the results (person registry data, project association, meeting doc reference) for use in Steps 4 and 5.
 
-**Progression:** Once the summary agent reports done, run straight through Steps 4–6 (Google Doc → meeting-doc link → project filing → report) with no user input. Only after all of that is complete do you ask the tidied-transcript question (Step 7). The pre-fetch runs concurrently with the summary and is quick.
+**Progression:** Once the summary agent reports done, run straight through Steps 4–7 (Google Doc → meeting-doc link → project filing → report → tidied transcript) with no user input at all. The pre-fetch runs concurrently with the summary and is quick.
 
 ### Step 4: Save summary to Google Drive
 
@@ -276,7 +276,7 @@ mkdir -p ~/Documents/Projects/acme-consulting/calls/summaries
 cp ~/.claude/skills/summarise-granola/data/summaries/2026-01-06-meeting--summary.md ~/Documents/Projects/acme-consulting/calls/summaries/
 ```
 
-**Store `{project_dir}` in memory for Step 8** (the tidied transcript agent will handle its own copy into `{project_dir}/calls/transcripts/` when it finishes, to avoid blocking the main workflow).
+**Store `{project_dir}` in memory for Step 7** (the tidied transcript agent will handle its own copy into `{project_dir}/calls/transcripts/` when it finishes, to avoid blocking the main workflow).
 
 **Step 5e: Offer to register unregistered people**
 
@@ -297,28 +297,15 @@ When reporting the files saved, always use **full expanded paths** (not relative
 2. **Files saved** — full absolute path of the summary in the project folder (if project association happened) and in the skill's data directory.
 3. **Auto-association note** (when applicable) — e.g. `Auto-associated with **Acme Consulting** (Jane Smith is registered to this project)`
 
-(The tidied-transcript note isn't reported here — that option is chosen in Step 7 and reported when the agent launches in Step 8.)
+(The tidied transcript isn't reported here — it's reported when the agent launches in Step 7.)
 
 **Do NOT run `open` on any markdown files.** The user's system opens them in VS Code, which is unwanted. The full paths in the report are already clickable in the terminal.
 
-### Step 7: Ask about the tidied transcript (the only interactive step)
+### Step 7: Launch tidied transcript agent (always; background, fire-and-forget)
 
-This is the fast, final decision — by now the summary, the Google Doc, and the meeting-doc link are all done. **Skip this step entirely** for group meetings (more than 2 participants), meetings without a clear person name, or internal/solo sessions; you've already reported in Step 6, so just stop.
+**This always runs — do not ask whether the user wants it.** Every call gets a tidied transcript, including group and internal calls. It is fire-and-forget: it blocks nothing, and Step 6's report has already gone out.
 
-**Do NOT ask about sharing the summary with the attendee — no email, no Slack DM, no offering to send anything.** The user never shares call notes; the Google Doc and meeting-doc link from Step 4 are the complete deliverable. This skill deliberately contains no sending steps.
-
-Use AskUserQuestion:
-
-- **"Create tidied transcript"** — fire-and-forget background agent launched in Step 8; does not block anything.
-- **"Skip"** — the default when the user submits an empty response.
-
-**Codex fallback:** If `AskUserQuestion` is unavailable, ask as a normal chat message; treat silence as "Skip".
-
-If the user selects "Skip", you're done.
-
-### Step 8: Launch tidied transcript agent (background, fire-and-forget)
-
-**Skip this step** if the user did not select "Create tidied transcript" in Step 7.
+**Do NOT ask about sharing the summary with the attendee — no email, no Slack DM, no offering to send anything.** The user never shares call notes; the Google Doc, the meeting-doc link and the appended transcript are the complete deliverable. This skill deliberately contains no sending steps and no closing question.
 
 Launch with `Agent(model: "sonnet", run_in_background: true)`. This is the last thing you do — the Google Doc is saved and the report is done. On launch, tell the user the tidied transcript is generating in the background, will be saved to [paths], and will be appended to the bottom of the summary doc when done. When the agent finishes later, acknowledge its completion notification with a one-liner (e.g. "Tidied transcript saved to X.").
 
