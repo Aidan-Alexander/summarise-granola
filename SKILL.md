@@ -5,7 +5,7 @@ description: For Granola call or meeting summaries, including "summarise my call
 
 # Granola transcript summarisation
 
-This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, saves it as a standalone Google Doc, and optionally links it from the person's meeting doc. For 1:1 calls where a meeting doc is configured, a link is added to the "Meeting recording summaries" tab (using the meeting date as the link text). For calls with no configured meeting doc, a standalone Google Doc is created for easy sharing. A tidied transcript is opt-in and runs in the background after the main workflow. The skill never sends the summary to the attendee — there is no email or Slack sharing step.
+This skill extracts raw meeting transcripts from the Granola app, creates a structured summary, saves it as a standalone Google Doc, and optionally links it from the person's meeting doc. For 1:1 calls where a meeting doc is configured, a link is added to the "Meeting recording summaries" tab (using the meeting date as the link text). For calls with no configured meeting doc, a standalone Google Doc is created for easy sharing. A tidied transcript is opt-in; when created it runs in the background and is appended to the bottom of the summary doc. The skill never sends the summary to the attendee — there is no email or Slack sharing step.
 
 ## Configuration
 
@@ -125,7 +125,14 @@ If the meeting title is generic (e.g., "Weekly sync", "Project check-in", "Team 
 
 Provide a free-text input option since participant names can't be predicted.
 
-**Important:** Never guess participant names. The Granola transcript only shows "Me" and "Other" as speaker labels, which doesn't identify the other person. If in doubt, ask.
+**Important:** Never guess participant names. Granola's speaker labels never identify the other person, so the name has to come from the title or from the user. If in doubt, ask.
+
+**Check which speaker labels the transcript uses** — it changes what you can rely on:
+
+- **`**Me**` / `**Other**`** — audio-source labels. `Me` is the person who recorded the call (the user), `Other` is everyone else. Identity is reliable.
+- **`**Speaker A**` / `**Speaker B**`** — diarisation labels, used by Granola since Sept 2026. These say only that two distinct voices were detected. **Which one is the user is NOT in the data** — `recording_context.recorder` is null and no per-segment audio source is returned. `granola.py` puts an "identity is unresolved" note at the top of any transcript with these labels.
+
+When the transcript is diarised, the mapping has to be inferred from content (who speaks for the user's organisation, who is asked questions, who says "we" about which team). Pass that inference to the summary agent as a hypothesis to verify, not a fact, and require it to report the mapping it settled on and its confidence. A confidently swapped pair of speakers is the failure mode to guard against — it produces a fluent summary that is wrong about who said what.
 
 **Store the confirmed names** and use them consistently throughout the tidied transcript and summary.
 
@@ -140,6 +147,8 @@ Launch the summary agent **in the background** (`run_in_background: true`) along
 Before launching, `Read` `references/summary-format.md` in an earlier message — paste its full contents verbatim into the agent prompt. The agent has no access to skill files, so the guidelines must travel with the prompt. (Read it before you launch so its contents are ready to paste; do not bundle the `Read` with the `Agent` call, or you won't have the contents yet.)
 
 Prompt the agent with: the **absolute path to the raw transcript** (the `saved_to` value from Step 2) plus an explicit instruction to `Read` that file itself, the confirmed participant names, the summary-format contents (pasted verbatim — the agent can't see skill files), and an instruction to write the result to `data/summaries/` using the same filename as the transcript (with `--summary.md` suffix). **Do not paste the transcript body into the prompt** — passing the path keeps the transcript (often 10k–25k tokens) out of the orchestrator's context; the agent reads it directly from disk.
+
+**If the transcript is diarised** (`**Speaker A**` / `**Speaker B**` rather than `**Me**` / `**Other**`), the prompt must also: state your inferred speaker→name mapping as a *hypothesis*, instruct the agent to verify it against the content and to follow the transcript if it disagrees, and require it to report back which speaker it mapped to whom and how confident it is. Do not present the mapping as settled — it is not in the data.
 
 **Pre-fetch: People registry** (in parallel with the agent)
 
@@ -311,7 +320,7 @@ If the user selects "Skip", you're done.
 
 **Skip this step** if the user did not select "Create tidied transcript" in Step 7.
 
-Launch with `Agent(model: "sonnet", run_in_background: true)`. This is the last thing you do — the Google Doc is saved and the report is done. On launch, tell the user the tidied transcript is generating in the background and will be saved to [paths] when done. When the agent finishes later, acknowledge its completion notification with a one-liner (e.g. "Tidied transcript saved to X.").
+Launch with `Agent(model: "sonnet", run_in_background: true)`. This is the last thing you do — the Google Doc is saved and the report is done. On launch, tell the user the tidied transcript is generating in the background, will be saved to [paths], and will be appended to the bottom of the summary doc when done. When the agent finishes later, acknowledge its completion notification with a one-liner (e.g. "Tidied transcript saved to X.").
 
 **Agent prompt (must be self-contained — the agent has no access to this skill file):**
 
@@ -321,8 +330,16 @@ Include:
 1. The **absolute path to the raw transcript** (`data/transcripts/{slug}.md` — the `saved_to` value from Step 2) plus an explicit instruction to `Read` that file itself. **Do not paste the transcript body** — the agent reads it from disk, keeping the large transcript out of the orchestrator's context.
 2. The **confirmed participant names** from Step 2.5.
 3. Instruction to write the tidied transcript to: `~/.claude/skills/summarise-granola/data/tidied-transcripts/{slug}--transcript.md` (create the directory with `mkdir -p`).
-4. If a project folder was determined in Step 5, also instruct the agent to copy the final file to: `~/Documents/Projects/{folder}/calls/transcripts/{slug}--transcript.md` (after creating the parent directory with `mkdir -p`).
-5. The tidying guidelines from `references/tidying-instructions.md` (pasted verbatim).
+4. **The append step (default — always include it).** The summary doc from Step 4a and the transcript it came from belong in one shareable place, so the agent appends the tidied transcript to the bottom of that doc as its last action. Pass the `doc_id` from Step 4a and instruct the agent to run, after writing the file:
+   ```bash
+   python3 ~/.claude/skills/summarise-granola/scripts/append_to_gdoc.py \
+     --doc-id "<doc_id from Step 4a>" --md <tidied-transcript.md>
+   ```
+   It renders onto the end of the doc after a page break, so the transcript starts on a fresh page below the summary. Tell the agent to prefix the file with a `# Tidied transcript` heading so the appended section is labelled. Returns `{"appended": true, ...}` or `{"error": "..."}`; on error the agent reports it and leaves the local file in place — a failed append never loses the transcript.
+
+   Omit this only when Step 4a created no doc (no `webapp_url` configured), or when the user explicitly asked for the transcript on its own. If the append fails with an unrecognised-parameter or `doc_id` error, the deployed Apps Script predates append support — redeploy it from `references/apps-script/Code.gs`.
+5. If a project folder was determined in Step 5, also instruct the agent to copy the final file to: `~/Documents/Projects/{folder}/calls/transcripts/{slug}--transcript.md` (after creating the parent directory with `mkdir -p`).
+6. The tidying guidelines from `references/tidying-instructions.md` (pasted verbatim).
 
 ## File locations
 

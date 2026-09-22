@@ -1,9 +1,14 @@
 /**
  * Markdown → formatted Google Doc converter.
  *
- * Receives JSON: { "title": "...", "markdown": "..." }
- * Creates a new Google Doc with the markdown rendered into proper
- * Google Docs formatting (headings, bold/italic, lists, links, etc).
+ * Create:  { "title": "...", "markdown": "..." }
+ *   Creates a new Google Doc with the markdown rendered into proper
+ *   Google Docs formatting (headings, bold/italic, lists, links, etc).
+ *
+ * Append:  { "doc_id": "...", "markdown": "...", "page_break": true }
+ *   Renders the markdown onto the END of an existing doc. Used to put the
+ *   tidied transcript at the bottom of the call-summary doc. page_break
+ *   defaults to true so the appended section starts on a fresh page.
  *
  * Uses only DocumentApp — no Drive REST API, no OAuth scope juggling.
  */
@@ -12,6 +17,20 @@ function doPost(e) {
   var data  = JSON.parse(e.postData.contents);
   var title = data.title    || "Untitled summary";
   var md    = data.markdown || "";
+
+  // Append mode: render onto the end of an existing doc rather than a new one.
+  if (data.doc_id) {
+    var target     = DocumentApp.openById(data.doc_id);
+    var targetBody = target.getBody();
+    if (data.page_break !== false) {
+      targetBody.appendPageBreak();
+    }
+    renderMarkdown(targetBody, md);
+    target.saveAndClose();
+    return ContentService.createTextOutput(
+      JSON.stringify({ doc_id: target.getId(), url: target.getUrl(), appended: true })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
 
   var doc  = DocumentApp.create(title);
   var body = doc.getBody();

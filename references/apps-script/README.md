@@ -43,6 +43,15 @@ If you want the summaries to look properly formatted (real headings, bold text, 
 
 That's it. Next time you run `/summarise-granola`, the Google Doc will be properly formatted.
 
+## Already set this up before September 2026? Redeploy it
+
+The same web app now also **appends the tidied transcript to the bottom of the summary doc**. That needs the current `Code.gs`, so a deployment made before then has to be updated:
+
+1. Open your Apps Script project and replace the whole of `Code.gs` with the current version from this folder
+2. **Deploy** → **Manage deployments** → pencil icon on the existing deployment → **Version: New version** → **Deploy**
+
+Use *Manage deployments* rather than *New deployment* — it keeps the same URL, so your `config.json` needs no change. Until you do this, doc creation keeps working and only the transcript append fails (with an error naming `doc_id`); the tidied transcript is still saved locally either way.
+
 ## If you want to turn it off later
 
 In Claude Code, paste:

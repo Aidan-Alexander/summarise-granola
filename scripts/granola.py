@@ -267,30 +267,63 @@ def _extract_transcript_json(text: str) -> dict:
         sys.exit(1)
 
 
-# Turn boundaries: the two-sided labels Granola uses ('Me'/'Them' as of
-# mid-2026, 'Microphone'/'Speaker' before that) or a capitalised name label,
-# preceded by 2+ spaces (Granola separates turns with a double space).
+# Turn boundaries. Granola has changed this format repeatedly:
+#   - 'Microphone'/'Speaker'   (pre mid-2026) — audio-source labels
+#   - 'Me'/'Them'              (mid-2026)     — audio-source labels
+#   - 'Speaker A'/'Speaker B'  (Sept 2026)    — diarisation, NO source info
+# Turns used to be separated by a double space; they are now newline-separated,
+# so the label may start a line (hence re.M) or follow 2+ spaces.
 _TURN_RE = re.compile(
-    r"(?:^\s*|\s{2,})(Me|Them|Microphone|Speaker|[A-Z][\w.'’-]*(?:\s[A-Z][\w.'’-]*){0,3})\s*:\s+"
+    r"(?:^[ \t]*|\s{2,})"
+    r"(Me|Them|Microphone|System audio|Speaker(?:\s+[A-Z0-9]{1,2})?"
+    r"|[A-Z][\w.'’-]*(?:\s[A-Z][\w.'’-]*){0,3})\s*:\s+",
+    re.M,
 )
 
+# Diarisation labels: 'Speaker A', 'Speaker 1' — two distinct voices, but which
+# one is the person who recorded the call is NOT recoverable from the response.
+_DIARISED_RE = re.compile(r"^Speaker\s+[A-Z0-9]{1,2}$", re.I)
 
-def format_transcript(transcript: str) -> str:
-    """Turn Granola's inline-labelled transcript string into speaker turns.
+_MIC_LABELS = ("me", "microphone")
+_SYSTEM_LABELS = ("them", "speaker", "system audio")
 
-    'Me' or 'Microphone' (the note-taker's own audio) maps to **Me**; every
-    other label ('Them', 'Speaker', or a named participant) maps to **Other**,
-    matching the format the rest of the skill expects."""
+
+def _canonical_speaker(label: str) -> str:
+    """Map a raw turn label to the speaker name used in the saved transcript.
+
+    Audio-source labels carry identity: the microphone side is the person who
+    recorded the call, so it becomes **Me** and the far side becomes **Other**.
+    Diarisation labels carry none, so they are preserved verbatim rather than
+    being flattened into **Other** — collapsing them would silently merge two
+    different voices into one and destroy the only speaker signal left."""
+    flat = " ".join(label.split())
+    low = flat.lower()
+    if low in _MIC_LABELS:
+        return "Me"
+    if low in _SYSTEM_LABELS:
+        return "Other"
+    if _DIARISED_RE.match(flat):
+        return flat[0].upper() + flat[1:]
+    return flat
+
+
+def format_transcript(transcript: str) -> tuple[str, list[str]]:
+    """Turn Granola's labelled transcript string into grouped speaker turns.
+
+    Returns (body, diarised_labels). A non-empty diarised_labels means the
+    transcript identifies speakers only as 'Speaker A'/'Speaker B' and the
+    Me-vs-Other mapping could not be established."""
     boundaries = list(_TURN_RE.finditer(transcript))
     turns: list[tuple[str, str]] = []
     for i, match in enumerate(boundaries):
-        label = match.group(1)
-        speaker = "Me" if label.lower() in ("me", "microphone") else "Other"
+        speaker = _canonical_speaker(match.group(1))
         text_start = match.end()
         text_end = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(transcript)
         text = transcript[text_start:text_end].strip()
         if text:
             turns.append((speaker, text))
+
+    diarised = sorted({s for s, _ in turns if _DIARISED_RE.match(s)})
 
     # Group consecutive turns by the same speaker.
     lines: list[str] = []
@@ -307,7 +340,7 @@ def format_transcript(transcript: str) -> str:
             current_text.append(text)
     if current_text:
         lines.append(f"**{current_speaker}**: {' '.join(current_text)}")
-    return "\n".join(lines)
+    return "\n".join(lines), diarised
 
 
 def build_transcript(doc_id: str) -> tuple[str, str, str]:
@@ -325,8 +358,23 @@ def build_transcript(doc_id: str) -> tuple[str, str, str]:
 
     date_str = iso_date(meeting_date_for(doc_id))
 
-    body = format_transcript(transcript)
-    markdown = f"# {title}\nDate: {date_str}\n\n{body}"
+    body, diarised = format_transcript(transcript)
+
+    # Granola stopped emitting audio-source labels in Sept 2026: the response
+    # now carries diarisation only ('Speaker A'/'Speaker B'), and
+    # recording_context.recorder is null. Nothing in the payload says which
+    # voice is the person who recorded the call, so say so in the file rather
+    # than let a summariser quietly guess and present the guess as fact.
+    note = ""
+    if diarised:
+        note = (
+            "> **Speaker identity is unresolved.** Granola labelled this transcript by\n"
+            f"> diarisation ({', '.join(diarised)}) rather than by audio source, so which\n"
+            "> speaker is the person who recorded the call cannot be determined from the\n"
+            "> transcript. Work it out from the content, and state the mapping you used\n"
+            "> and your confidence in it.\n\n"
+        )
+    markdown = f"# {title}\nDate: {date_str}\n\n{note}{body}"
     return markdown, title, date_str
 
 
