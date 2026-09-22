@@ -77,7 +77,8 @@ function renderMarkdown(body, md) {
     if (hMatch) {
       var level = hMatch[1].length;
       var p = body.appendParagraph("");
-      p.setHeading(HEADINGS[level - 1]);
+      // Zero indents explicitly: some accounts' saved default heading styles carry an indent.
+      p.setHeading(HEADINGS[level - 1]).setIndentStart(0).setIndentFirstLine(0);
       renderInline(p.editAsText(), hMatch[2]);
       i++;
       continue;
